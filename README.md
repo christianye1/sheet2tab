@@ -1,29 +1,35 @@
 # Sheet2Tab (MVP)
 
-Take a photo of printed sheet music on your iPhone and get back guitar tab.
+Take a photo (or PDF) of printed sheet music on your iPhone and get back guitar tab or a
+piano view of both hands, with playback to play along to.
 
 ```
-iPhone app ──JPEG──▶ FastAPI backend ──▶ oemer (OMR) ──▶ MusicXML ──▶ music21 ──▶ fingering ──▶ ASCII tab
+iPhone app ──JPEG pages──▶ FastAPI backend ──▶ pre-checks ──▶ oemer (OMR) ──▶ MusicXML
+   ──▶ timing cleanup ──▶ music21 ──▶ guitar: fingering + ASCII tab  |  piano: notes per hand
+   ──▶ back to the app: text + note list ──▶ playback
 ```
 
 ```
 backend/
   app/
-    main.py          FastAPI app: POST /convert, POST /jobs, GET /jobs/{id}, GET /health
-    jobs.py          background jobs with per-step progress
-    config.py        host/port/timeouts (env vars)
-    omr.py           image preprocessing + oemer subprocess
-    parser.py        MusicXML -> NoteEvents (octave handling, range shifting)
+    main.py          FastAPI app: POST /jobs, GET/DELETE /jobs/{id}, POST /convert, GET /health
+    jobs.py          background jobs: per-step progress and timings, cancel
+    config.py        host/port/timeouts/limits (env vars)
+    omr.py           image preprocessing, OMR cache, oemer subprocess with streamed progress
+    oemer_runner.py  runs the oemer CLI with a workaround for one of its crashes
+    tab_detect.py    refuses sheets that already have 6-line TAB staffs
+    omr_cleanup.py   fixes note timing in oemer's MusicXML
+    parser.py        MusicXML -> note events (guitar) or notes per hand (piano)
     guitar.py        tuning, Position/NoteEvent types, candidate positions
-    fingering.py     FingeringStrategy interface + LowestFretStrategy (placeholder)
-    tab_renderer.py  6-line ASCII tab
-    pipeline.py      glue: musicxml_to_tab(), image_to_tab()
-  samples/ode_to_joy.musicxml
+    fingering.py     HandPositionStrategy (default) and LowestFretStrategy
+    tab_renderer.py  6-line ASCII tab; piano note names per hand
+    pipeline.py      glue: images_to_tab(), musicxml_pages_to_tab()
+  samples/           test inputs (other sheet music in here stays local, see .gitignore)
   scripts/convert_file.py   run the pipeline from the command line
   tests/
 ios/
   Sheet2Tab.xcodeproj
-  Sheet2Tab/         SwiftUI sources
+  Sheet2Tab/         SwiftUI sources, plus the GeneralUser GS SoundFont for playback
 ```
 
 ## 1. Backend setup
@@ -65,6 +71,13 @@ the venv.
 .venv/bin/python -m app.main
 ```
 
+While working on the backend, this restarts the server whenever a file in `app/` changes
+(a restart drops conversions that are still running):
+
+```bash
+.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir app
+```
+
 It listens on `0.0.0.0:8000`, so other devices on your Wi-Fi can reach it. Settings
 are environment variables:
 
@@ -72,35 +85,37 @@ are environment variables:
 |---|---|---|
 | `SHEET2TAB_HOST` | `0.0.0.0` | bind address |
 | `SHEET2TAB_PORT` | `8000` | port |
-| `SHEET2TAB_OMR_TIMEOUT` | `600` | seconds before OMR is aborted |
+| `SHEET2TAB_OMR_TIMEOUT` | `600` | seconds before OMR of one page is aborted |
 | `SHEET2TAB_OMR_MAX_SIDE` | `2500` | images are downscaled to this many pixels on their longest side |
-| `SHEET2TAB_MAX_UPLOAD_MB` | `20` | upload size limit |
-| `SHEET2TAB_OMR_FAILURE_DIR` | `backend/.omr_failures` | failed OMR inputs + oemer output are saved here; empty string disables |
+| `SHEET2TAB_MAX_UPLOAD_MB` | `20` | size limit per uploaded file |
+| `SHEET2TAB_MAX_PAGES` | `20` | pages per conversion |
 | `SHEET2TAB_OMR_CACHE_DIR` | `backend/.omr_cache` | OMR results are cached here by image hash; empty string disables |
+| `SHEET2TAB_OMR_FAILURE_DIR` | `backend/.omr_failures` | failed OMR inputs + oemer output are saved here; empty string disables |
+
+### API
+
+The app uses background jobs, because OMR takes minutes per page:
+
+| Endpoint | |
+|---|---|
+| `POST /jobs` | Upload one or more pages (`file` fields, in order) and an optional `instrument` (`guitar` or `piano`); returns a job ID at once |
+| `GET /jobs/{id}` | Status, current step, overall progress, seconds per step, and the result when done |
+| `DELETE /jobs/{id}` | Cancel; stops oemer within a fraction of a second |
+| `POST /convert` | One file, synchronous: the request stays open until the result is ready |
+| `GET /health` | Connection check |
+
+Several pages are converted into one result: each page goes through OMR on its own (and is
+cached on its own), page 2 starts where page 1 ends, and a page that fails is skipped with
+a warning. Only one OMR runs at a time; other jobs wait as "queued".
 
 Check it from the Mac:
 
 ```bash
 curl http://localhost:8000/health
 curl -F "file=@samples/ode_to_joy.musicxml" http://localhost:8000/convert   # MusicXML upload skips OMR
+curl -F "file=@samples/ode_to_joy.musicxml" -F instrument=piano http://localhost:8000/convert
 curl -F "file=@photo.jpg" http://localhost:8000/convert
 ```
-
-Both endpoints take an optional form field `instrument`: `guitar` (default) or `piano`.
-Piano mode reads both staves (the bottom two on piano-vocal sheets) as right and left hand,
-skips the guitar steps, and returns note names per hand instead of tab:
-
-```bash
-curl -F "file=@samples/ode_to_joy.musicxml" -F instrument=piano http://localhost:8000/convert
-```
-
-`POST /jobs` also takes several `file` fields: consecutive pages of one piece, converted
-into one result (each page through OMR on its own and cached on its own; page 2 starts where
-page 1 ends; a page that fails is skipped with a warning). At most 20 pages
-(`SHEET2TAB_MAX_PAGES`). The app sends every page of a PDF or a multi-page scan.
-
-The app uses `POST /jobs` instead: it returns a job ID right away, and `GET /jobs/{id}`
-reports the current step, overall progress, how long each step took, and finally the result.
 
 Interactive API docs are at http://localhost:8000/docs.
 
@@ -116,7 +131,9 @@ e.g. `http://192.168.1.20:8000`.
 
 If the phone can't connect, macOS may be blocking it: the first time you start the server, allow
 incoming connections for Python when prompted, or check System Settings → Network → Firewall.
-Both devices must be on the same Wi-Fi network (guest networks often isolate devices).
+Both devices must be on the same Wi-Fi network. Company, university and guest networks often
+isolate devices; then turn on the iPhone's Personal Hotspot, connect the Mac to it, and use
+the Mac's new IP.
 
 ## 3. Run the app on your iPhone
 
@@ -133,14 +150,31 @@ Both devices must be on the same Wi-Fi network (guest networks often isolate dev
    and trust the developer certificate (Settings → General → VPN & Device Management).
 6. In the app, tap ⚙︎, enter the backend URL from step 2, and tap **Test connection**.
    Allow local network access when iOS asks.
-7. Tap **Scan**, frame the page (the scanner finds its edges; drag the corners if needed), then tap **Convert to Tab**.
+
+In the iOS Simulator the scanner is unavailable (no camera); use `http://localhost:8000`
+and add test images with `xcrun simctl addmedia booted <image>`.
+
+## Using the app
+
+1. Pick the sheet music:
+   - **Scan**: Apple's document scanner finds the page edges and straightens the page; drag
+     the corners if needed. All scanned pages are used.
+   - **Library**: a photo; the page is detected and you can adjust its corners or use the
+     whole photo.
+   - **Files**: a PDF (all pages, rendered sharply) or an image.
+2. Choose **Guitar** or **Piano** and tap **Convert to Tab**. The screen shows the current
+   step, a progress bar and how long each step took. **Cancel** stops the server too.
+3. The result shows the tab (guitar) or note names per hand (piano), plus warnings.
+4. **Play** opens playback: for guitar, notes scroll along 6 string lanes toward a line
+   where they are played; for piano, notes fall onto a keyboard (right hand blue, left
+   orange). A note's length on screen is its duration. Tap to pause.
 
 ## Saving tabs
 
 On the result screen, tap **Save**. The name is pre-filled with the title the phone read
-from the photo (Apple Vision OCR: the largest text near the top of the page). Correct it
-if it's wrong, pick a folder or create one, and save. The **Library** tab lists saved tabs.
-Long-press or swipe an item to rename, move or delete it.
+from the photo (Apple Vision OCR: the largest text near the top of the page) or from the
+PDF's text. Correct it if it's wrong, pick a folder or create one, and save. The **Library**
+tab lists saved tabs. Long-press or swipe an item to rename, move or delete it.
 
 Each tab is a JSON file and each folder is a real folder in the app's Documents directory:
 
@@ -151,15 +185,25 @@ Each tab is a JSON file and each folder is a real folder in the app's Documents 
 
 ## How it works / MVP limitations
 
-- **OMR** is oemer. It's slow on a CPU (roughly 1–4 minutes per page on a laptop) and
-  makes mistakes; the app keeps the screen awake and waits up to 15 minutes. If oemer
-  proves too unreliable, the fallback is Audiveris (not integrated yet).
-- **Parts:** only the first part/staff is converted (for piano music, that's the
-  right hand); a warning says so.
-- **Octaves:** guitar scores (treble clef with an 8 below, or a guitar instrument or title)
-  are transposed down an octave to sounding pitch. Any note outside E2–C6 is shifted by
-  octaves into range, with a warning.
-- **Fingering:** `HandPositionStrategy` keeps the fretting hand compact and still. Each
+- **OMR** is oemer. It's slow on a CPU (about 3–5 minutes per page on a laptop; ~95% of that
+  is its two neural networks) and makes mistakes, especially in rhythm. Its rule-based steps
+  after the networks crash on some inputs; one crash is worked around in `oemer_runner.py`.
+  Each failure is saved to `backend/.omr_failures/` for debugging.
+- **Pre-checks:** a repeated image (same bytes) skips OMR via the cache. Sheets that already
+  contain 6-line TAB staffs are refused, because they make oemer crash.
+- **OMR timing:** oemer writes each staff's notes in the right order but positions them with
+  unreliable `<backup>`s and filler rests, so `app/omr_cleanup.py` lays them out one after
+  another per staff before parsing. Rests oemer didn't recognize are lost, so the notes
+  after them come early within that measure.
+- **Staves:** a *staff* is one set of five lines; piano music has two per line of music
+  (right and left hand), piano-vocal sheets three. Guitar mode converts only the top staff,
+  with a warning when there are more. Piano mode uses the bottom two as right and left hand.
+- **Tempo:** from the score's metronome mark, else 90 BPM. oemer never supplies one (it
+  doesn't read text), so OMR results always play at 90 BPM.
+- **Octaves (guitar):** guitar scores (treble clef with an 8 below, or a guitar instrument or
+  title) are transposed down an octave to sounding pitch. Any note outside E2–C6 is shifted
+  by octaves into range, with a warning.
+- **Fingering (guitar):** `HandPositionStrategy` keeps the fretting hand compact and still. Each
   candidate fingering of a note or chord is scored for spread (distance of its fretted notes
   from their average fret), stretch (a large penalty beyond 4 frets) and height (a small
   preference for low frets); moving the hand between notes costs the distance between their
@@ -167,9 +211,16 @@ Each tab is a JSON file and each folder is a real folder in the app's Documents 
   piece is found with dynamic programming. Notes that can't be placed at all are dropped
   with a warning. The weights are constructor arguments; `LowestFretStrategy` (lowest fret
   per note) is kept for comparison. Pass either to `musicxml_to_tab(..., strategy=...)`.
-- **OMR timing:** oemer writes each staff's notes in the right order but positions them with
-  unreliable `<backup>`s and filler rests, so `app/omr_cleanup.py` lays them out one after
-  another per staff before parsing. Rests oemer didn't recognize are lost, so the notes
-  after them come early within that measure.
-- **Tab:** standard 6 lines, high e on top, `|` between measures, wrapped at 80
+- **Tab (guitar):** standard 6 lines, high e on top, `|` between measures, wrapped at 80
   columns. Spacing roughly follows note duration; tied notes are not re-struck.
+- **Piano text:** note names per hand, one column per measure (`R |E4 F4|` / `L |C3+G3|`);
+  tied notes become one long note.
+- **Playback:** Apple's sequencer and sampler with the bundled GeneralUser GS SoundFont: jazz
+  guitar (GM 26) and tine electric piano (GM 4). The acoustic guitar presets cut off after
+  about 1 s in Apple's sampler, so they aren't used.
+
+## Licenses
+
+oemer and onnxruntime (MIT), music21 (BSD-3-Clause) and FastAPI (MIT) run on the backend.
+The app bundles GeneralUser GS v2.0.3 by S. Christian Collins, whose license allows use in
+software projects including commercial ones (`ios/Sheet2Tab/GeneralUser-GS-LICENSE.txt`).

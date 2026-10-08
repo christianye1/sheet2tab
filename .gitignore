@@ -1,0 +1,17 @@
+.venv/
+.omr_cache/
+.omr_failures/
+__pycache__/
+.pytest_cache/
+*.pyc
+.DS_Store
+xcuserdata/
+DerivedData/
+build/
+
+# Sheet music used only for local testing (copyrighted or of unknown origin).
+# The samples the tests use (ode_to_joy.musicxml, noten_sample*.png) stay in the repo.
+backend/samples/*
+!backend/samples/ode_to_joy.musicxml
+!backend/samples/noten_sample.png
+!backend/samples/noten_samples_big.png

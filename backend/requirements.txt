@@ -1,0 +1,10 @@
+music21
+# 0.1.8+ requires onnxruntime-gpu, which has no macOS wheels
+oemer==0.1.5
+# oemer still uses np.int, removed in NumPy 1.24
+numpy<1.24
+fastapi
+uvicorn[standard]
+python-multipart
+pytest
+httpx
